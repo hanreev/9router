@@ -39,14 +39,18 @@ function unstableRandom() {
   return randomPart;
 }
 
-export function generateSessionId(timestamp = Date.now()) {
+export function generateSessionTimestamp(timestamp = Date.now()) {
   const current = BigInt(timestamp) * 0x1000n + 1n;
   const value = ~current;
-  const time = Array.from({ length: 6 }, (_, index) =>
+  return Array.from({ length: 6 }, (_, index) =>
     Number((value >> BigInt(40 - 8 * index)) & 0xffn)
       .toString(16)
       .padStart(2, "0")
   ).join("");
+}
+
+export function generateSessionId(timestamp = Date.now()) {
+  const time = generateSessionTimestamp(timestamp);
   return `ses_${time}${unstableRandom()}`;
 }
 
@@ -61,20 +65,33 @@ export function generateRequestId(timestamp = Date.now()) {
   return `msg_${time}${unstableRandom()}`;
 }
 
+const translatedSessions = new Map();
+const MAX_TRANSLATED_SESSIONS = 1000;
 export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
+
+  // Key mirrors the hash input exactly: separator collisions and non-string ids can't diverge.
+  const sessionKey = `${sessionId || ""}\0${clientTool || "generic"}`;
+  if (translatedSessions.has(sessionKey)) return translatedSessions.get(sessionKey);
+
   const digest = crypto
     .createHash("sha256")
     .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
+  const time = generateSessionTimestamp();
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  return `ses_${timeHex}${randomPart}`;
+  const result = `ses_${time}${randomPart}`;
+
+  if (translatedSessions.size >= MAX_TRANSLATED_SESSIONS) {
+    translatedSessions.delete(translatedSessions.keys().next().value);
+  }
+  translatedSessions.set(sessionKey, result);
+  return result;
 }
 
 function toolNameOf(tool) {
