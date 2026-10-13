@@ -15,7 +15,7 @@ const MAX_SESSION_LENGTH = 256;
 
 const RESPONSES_BASE_URL = "https://opencode.ai/zen/v1/responses";
 const MAX_TOOL_NAME_LEN = 128;
-const OPENCODE_UA = "opencode/1.18.31";
+const OPENCODE_UA = "opencode/1.19.0";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 // Free-tier fingerprint (mirrors opencode executor, PR #4132): upstream 403s
@@ -54,15 +54,19 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${time}${unstableRandom()}`;
 }
 
-export function generateRequestId(timestamp = Date.now()) {
-  const current = BigInt(timestamp) * 0x1000n + 1n;
-  const value = current;
-  const time = Array.from({ length: 6 }, (_, index) =>
+// 12-hex time prefix shared by every msg_ id: packs the timestamp the same way
+// upstream expects (48-bit big-endian of ts*0x1000+1).
+function requestTimeHex(timestamp = Date.now()) {
+  const value = BigInt(timestamp) * 0x1000n + 1n;
+  return Array.from({ length: 6 }, (_, index) =>
     Number((value >> BigInt(40 - 8 * index)) & 0xffn)
       .toString(16)
       .padStart(2, "0")
   ).join("");
-  return `msg_${time}${unstableRandom()}`;
+}
+
+export function generateRequestId(timestamp = Date.now()) {
+  return `msg_${requestTimeHex(timestamp)}${unstableRandom()}`;
 }
 
 const translatedSessions = new Map();
@@ -71,11 +75,14 @@ export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-
-  // Key mirrors the hash input exactly: separator collisions and non-string ids can't diverge.
-  const sessionKey = `${sessionId || ""}\0${clientTool || "generic"}`;
-  if (translatedSessions.has(sessionKey)) return translatedSessions.get(sessionKey);
-
+  const cacheKey = `${sessionId || ""}\0${clientTool || "generic"}`;
+  const existing = translatedSessions.get(cacheKey);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    translatedSessions.delete(cacheKey);
+    translatedSessions.set(cacheKey, existing);
+    return existing.sessionId;
+  }
   const digest = crypto
     .createHash("sha256")
     .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
@@ -85,13 +92,12 @@ export function translateSessionId(sessionId, clientTool = "") {
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  const result = `ses_${time}${randomPart}`;
-
+  const id = `ses_${time}${randomPart}`;
   if (translatedSessions.size >= MAX_TRANSLATED_SESSIONS) {
     translatedSessions.delete(translatedSessions.keys().next().value);
   }
-  translatedSessions.set(sessionKey, result);
-  return result;
+  translatedSessions.set(cacheKey, { sessionId: id, lastUsed: Date.now() });
+  return id;
 }
 
 function toolNameOf(tool) {

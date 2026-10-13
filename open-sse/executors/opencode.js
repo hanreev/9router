@@ -15,7 +15,7 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 
-const OPENCODE_UA = "opencode/1.18.31";
+const OPENCODE_UA = "opencode/1.19.0";
 const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
@@ -72,15 +72,19 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${time}${unstableRandom()}`;
 }
 
-export function generateRequestId(timestamp = Date.now()) {
-  const current = BigInt(timestamp) * 0x1000n + 1n;
-  const value = current;
-  const time = Array.from({ length: 6 }, (_, index) =>
+// 12-hex time prefix shared by every msg_ id: packs the timestamp the same way
+// upstream expects (48-bit big-endian of ts*0x1000+1).
+function requestTimeHex(timestamp = Date.now()) {
+  const value = BigInt(timestamp) * 0x1000n + 1n;
+  return Array.from({ length: 6 }, (_, index) =>
     Number((value >> BigInt(40 - 8 * index)) & 0xffn)
       .toString(16)
       .padStart(2, "0")
   ).join("");
-  return `msg_${time}${unstableRandom()}`;
+}
+
+export function generateRequestId(timestamp = Date.now()) {
+  return `msg_${requestTimeHex(timestamp)}${unstableRandom()}`;
 }
 
 const translatedSessions = new Map();
@@ -89,11 +93,14 @@ export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-
-  // Key mirrors the hash input exactly: separator collisions and non-string ids can't diverge.
-  const sessionKey = `${sessionId || ""}\0${clientTool || "generic"}`;
-  if (translatedSessions.has(sessionKey)) return translatedSessions.get(sessionKey);
-
+  const cacheKey = `${sessionId || ""}\0${clientTool || "generic"}`;
+  const existing = translatedSessions.get(cacheKey);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    translatedSessions.delete(cacheKey);
+    translatedSessions.set(cacheKey, existing);
+    return existing.sessionId;
+  }
   const digest = crypto
     .createHash("sha256")
     .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
@@ -103,13 +110,12 @@ export function translateSessionId(sessionId, clientTool = "") {
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  const result = `ses_${time}${randomPart}`;
-
+  const id = `ses_${time}${randomPart}`;
   if (translatedSessions.size >= MAX_TRANSLATED_SESSIONS) {
     translatedSessions.delete(translatedSessions.keys().next().value);
   }
-  translatedSessions.set(sessionKey, result);
-  return result;
+  translatedSessions.set(cacheKey, { sessionId: id, lastUsed: Date.now() });
+  return id;
 }
 
 function normalizeSession(value) {
@@ -207,22 +213,36 @@ function lastUserText(body) {
 }
 
 // The real CLI sends the current user message id (stable per turn, same on
-// retries) as x-opencode-request. Derive it deterministically from the
-// session plus the last user message so retries share the id.
+// retries) as x-opencode-request. Mint it with a real timestamp — a
+// digest-derived timeHex fails upstream time validation — and cache per
+// session+message so retries share the id. Key mirrors the hash input exactly:
+// separator collisions and non-string ids can't diverge.
+const derivedRequestIds = new Map();
+const MAX_DERIVED_REQUEST_IDS = 1000;
 export function deriveRequestId(sessionId, body) {
   const text = lastUserText(body);
   if (!text) return generateRequestId();
+  const cacheKey = `${sessionId || ""}\0${text}`;
+  const existing = derivedRequestIds.get(cacheKey);
+  if (existing !== undefined) {
+    derivedRequestIds.delete(cacheKey);
+    derivedRequestIds.set(cacheKey, existing);
+    return existing;
+  }
   const digest = crypto
     .createHash("sha256")
     .update(`opencode-req\0${sessionId || ""}\0${text}`)
     .digest();
-  const timeHex = digest.subarray(0, 6).toString("hex");
   let randomPart = "";
   for (let i = 6; i < 20; i++) {
     randomPart += BASE62_CHARS[digest[i] % 62];
   }
-  const id = `msg_${timeHex}${randomPart}`;
-  return OPENCODE_REQUEST_RE.test(id) ? id : generateRequestId();
+  const id = `msg_${requestTimeHex()}${randomPart}`;
+  if (derivedRequestIds.size >= MAX_DERIVED_REQUEST_IDS) {
+    derivedRequestIds.delete(derivedRequestIds.keys().next().value);
+  }
+  derivedRequestIds.set(cacheKey, id);
+  return id;
 }
 
 function normalizeRequestId(value) {
